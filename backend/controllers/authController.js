@@ -1,144 +1,167 @@
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import { supabaseAdmin } from '../config/supabase.js';
+import { getUserModel } from '../models/index.js';
+import authService from '../services/authService.js';
+import { formatUserResponse, createApiResponse, logApiRequest } from '../utils/helpers.js';
+import { SUCCESS_MESSAGES, ERROR_MESSAGES, HTTP_STATUS } from '../utils/constants.js';
+import { AppError, asyncHandler } from '../middleware/errorHandler.js';
 
-const generateToken = (userId) => {
-  return jwt.sign({ userId }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN
-  });
-};
+/**
+ * Register a new user
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const signup = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'User Signup');
+  
+  const { username, email, password } = req.body;
+  const User = getUserModel();
 
-export const signup = async (req, res) => {
-  try {
-    const { name, email, password } = req.body;
-
-    // Check if user already exists
-    const { data: existingUser } = await supabaseAdmin
-      .from('users')
-      .select('id')
-      .eq('email', email)
-      .single();
-
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'User with this email already exists'
-      });
-    }
-
-    // Hash password
-    const saltRounds = 12;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
-
-    // Create user
-    const { data: newUser, error } = await supabaseAdmin
-      .from('users')
-      .insert([
-        {
-          name: name.trim(),
-          email: email.toLowerCase(),
-          password: hashedPassword,
-          points: 0,
-          badges: [],
-          created_at: new Date().toISOString()
-        }
-      ])
-      .select('id, name, email, points, badges, created_at')
-      .single();
-
-    if (error) {
-      console.error('Signup error:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to create user account'
-      });
-    }
-
-    // Generate JWT token
-    const token = generateToken(newUser.id);
-
-    res.status(201).json({
-      success: true,
-      message: 'Account created successfully',
-      data: {
-        user: newUser,
-        token
+  // Check if user already exists
+  let existingUser;
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    existingUser = await User.findOne({
+      $or: [{ email }, { username }]
+    });
+  } else {
+    existingUser = await User.findOne({
+      where: {
+        [User.sequelize.Sequelize.Op.or]: [
+          { email },
+          { username }
+        ]
       }
     });
-  } catch (error) {
-    console.error('Signup controller error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
   }
-};
 
-export const login = async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    // Find user by email
-    const { data: user, error } = await supabaseAdmin
-      .from('users')
-      .select('*')
-      .eq('email', email.toLowerCase())
-      .single();
-
-    if (error || !user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid email or password'
-      });
-    }
-
-    // Verify password
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid email or password'
-      });
-    }
-
-    // Generate JWT token
-    const token = generateToken(user.id);
-
-    // Remove password from response
-    const { password: _, ...userWithoutPassword } = user;
-
-    res.json({
-      success: true,
-      message: 'Login successful',
-      data: {
-        user: userWithoutPassword,
-        token
-      }
-    });
-  } catch (error) {
-    console.error('Login controller error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
+  if (existingUser) {
+    const field = existingUser.email === email ? 'email' : 'username';
+    throw new AppError(`User with this ${field} already exists`, HTTP_STATUS.CONFLICT);
   }
-};
 
-export const getProfile = async (req, res) => {
-  try {
-    const { password: _, ...userWithoutPassword } = req.user;
-    
-    res.json({
-      success: true,
-      data: {
-        user: userWithoutPassword
-      }
-    });
-  } catch (error) {
-    console.error('Get profile error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
+  // Create new user
+  const userData = { username, email, password };
+  let newUser;
+
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    newUser = new User(userData);
+    await newUser.save();
+  } else {
+    newUser = await User.create(userData);
   }
-};
+
+  // Generate tokens
+  const userId = newUser.id || newUser._id;
+  const tokens = authService.generateTokens(userId);
+
+  // Set refresh token cookie
+  authService.setRefreshTokenCookie(res, tokens.refreshToken);
+
+  // Format response
+  const userResponse = formatUserResponse(newUser);
+  const responseData = {
+    user: userResponse,
+    accessToken: tokens.accessToken
+  };
+
+  res.status(HTTP_STATUS.CREATED).json(
+    createApiResponse(true, SUCCESS_MESSAGES.USER_CREATED, responseData)
+  );
+});
+
+/**
+ * Authenticate user login
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const login = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'User Login');
+  
+  const { email, password } = req.body;
+  const User = getUserModel();
+
+  // Find user with password field included
+  let user;
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    user = await User.findOne({ email }).select('+password');
+  } else {
+    user = await User.scope('withPassword').findOne({ where: { email } });
+  }
+
+  if (!user) {
+    throw new AppError(ERROR_MESSAGES.INVALID_CREDENTIALS, HTTP_STATUS.UNAUTHORIZED);
+  }
+
+  // Verify password
+  const isPasswordValid = await user.comparePassword(password);
+  if (!isPasswordValid) {
+    throw new AppError(ERROR_MESSAGES.INVALID_CREDENTIALS, HTTP_STATUS.UNAUTHORIZED);
+  }
+
+  // Generate tokens
+  const userId = user.id || user._id;
+  const tokens = authService.generateTokens(userId);
+
+  // Set refresh token cookie
+  authService.setRefreshTokenCookie(res, tokens.refreshToken);
+
+  // Format response
+  const userResponse = formatUserResponse(user);
+  const responseData = {
+    user: userResponse,
+    accessToken: tokens.accessToken
+  };
+
+  res.status(HTTP_STATUS.OK).json(
+    createApiResponse(true, SUCCESS_MESSAGES.LOGIN_SUCCESS, responseData)
+  );
+});
+
+/**
+ * Refresh access token using refresh token
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const refresh = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'Token Refresh');
+  
+  const userId = req.user.id || req.user._id;
+  
+  // Generate new access token
+  const accessToken = authService.generateAccessToken(userId);
+  
+  const responseData = { accessToken };
+  
+  res.status(HTTP_STATUS.OK).json(
+    createApiResponse(true, SUCCESS_MESSAGES.TOKEN_REFRESHED, responseData)
+  );
+});
+
+/**
+ * Logout user and clear refresh token
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const logout = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'User Logout');
+  
+  // Clear refresh token cookie
+  authService.clearRefreshTokenCookie(res);
+  
+  res.status(HTTP_STATUS.NO_CONTENT).json(
+    createApiResponse(true, SUCCESS_MESSAGES.LOGOUT_SUCCESS)
+  );
+});
+
+/**
+ * Get current user profile
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const getProfile = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'Get Profile');
+  
+  const userResponse = formatUserResponse(req.user);
+  
+  res.status(HTTP_STATUS.OK).json(
+    createApiResponse(true, 'Profile retrieved successfully', { user: userResponse })
+  );
+});

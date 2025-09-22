@@ -1,361 +1,343 @@
-import { supabaseAdmin } from '../config/supabase.js';
+import { getReportModel, getUpvoteModel, getUserModel } from '../models/index.js';
+import s3Service from '../services/s3Service.js';
+import { 
+  formatReportResponse, 
+  createApiResponse, 
+  logApiRequest,
+  sanitizePagination,
+  sanitizeSort,
+  buildMongoSort,
+  buildSequelizeOrder,
+  buildPaginationMeta,
+  coordinatesToPostgresPoint
+} from '../utils/helpers.js';
+import { SUCCESS_MESSAGES, ERROR_MESSAGES, HTTP_STATUS } from '../utils/constants.js';
+import { AppError, asyncHandler } from '../middleware/errorHandler.js';
 
-export const createReport = async (req, res) => {
-  try {
-    const {
-      title,
-      description,
-      category,
-      priority,
-      latitude,
-      longitude,
-      photo_url,
-      anonymous,
-      manual_location
-    } = req.body;
+/**
+ * Create a new report
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const createReport = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'Create Report');
+  
+  const { title, description, location } = req.body;
+  const userId = req.user.id || req.user._id;
+  const Report = getReportModel();
 
-    const reportData = {
-      title: title.trim(),
-      description: description.trim(),
-      category: category.trim(),
-      priority,
-      status: 'Submitted',
-      vouch_count: 0,
-      anonymous: anonymous || false,
-      user_id: req.user.id,
-      created_at: new Date().toISOString()
-    };
+  // Handle photo upload if present
+  let photoUrl = null;
+  if (req.file) {
+    photoUrl = await s3Service.uploadFile(
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype,
+      'reports'
+    );
+  }
 
-    // Add geolocation if provided
-    if (latitude && longitude) {
-      reportData.latitude = parseFloat(latitude);
-      reportData.longitude = parseFloat(longitude);
-    }
+  // Prepare report data
+  const reportData = {
+    title,
+    description,
+    location,
+    photoUrl,
+    status: 'Open',
+    upvoteCount: 0
+  };
 
-    // Add manual location if provided
-    if (manual_location) {
-      reportData.manual_location = manual_location;
-    }
-
-    // Add photo URL if provided
-    if (photo_url) {
-      reportData.photo_url = photo_url;
-    }
-
-    const { data: newReport, error } = await supabaseAdmin
-      .from('reports')
-      .insert([reportData])
-      .select(`
-        *,
-        users!reports_user_id_fkey (
-          id,
-          name,
-          email
-        )
-      `)
-      .single();
-
-    if (error) {
-      console.error('Create report error:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to create report'
-      });
-    }
-
-    // Award points to user for creating report
-    const { error: pointsError } = await supabaseAdmin
-      .from('users')
-      .update({ 
-        points: req.user.points + 10 
-      })
-      .eq('id', req.user.id);
-
-    if (pointsError) {
-      console.error('Points update error:', pointsError);
-    }
-
-    res.status(201).json({
-      success: true,
-      message: 'Report created successfully',
-      data: {
-        report: newReport
-      }
-    });
-  } catch (error) {
-    console.error('Create report controller error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
+  // Create report based on database type
+  let newReport;
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    reportData.author = userId;
+    newReport = new Report(reportData);
+    await newReport.save();
+    
+    // Populate author information
+    await newReport.populate('author', 'username email');
+  } else {
+    // PostgreSQL
+    reportData.authorId = userId;
+    reportData.location = coordinatesToPostgresPoint(location.coordinates);
+    
+    newReport = await Report.create(reportData);
+    
+    // Include author information
+    const User = getUserModel();
+    newReport = await Report.findByPk(newReport.id, {
+      include: [{
+        model: User,
+        as: 'author',
+        attributes: ['id', 'username', 'email']
+      }]
     });
   }
-};
 
-export const editReport = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { description } = req.body;
+  const reportResponse = formatReportResponse(newReport);
+  
+  res.status(HTTP_STATUS.CREATED).json(
+    createApiResponse(true, SUCCESS_MESSAGES.REPORT_CREATED, { report: reportResponse })
+  );
+});
 
-    // Check if report exists and belongs to user
-    const { data: existingReport, error: fetchError } = await supabaseAdmin
-      .from('reports')
-      .select('*')
-      .eq('id', id)
-      .single();
+/**
+ * Get all reports with pagination and filtering
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const getReports = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'Get Reports');
+  
+  const Report = getReportModel();
+  const User = getUserModel();
+  const { page, limit, skip } = sanitizePagination(req.query);
+  const { sortBy, sortOrder } = sanitizeSort(req.query);
+  const { status } = req.query;
 
-    if (fetchError || !existingReport) {
-      return res.status(404).json({
-        success: false,
-        message: 'Report not found'
-      });
-    }
+  let reports, total;
 
-    if (existingReport.user_id !== req.user.id) {
-      return res.status(403).json({
-        success: false,
-        message: 'You can only edit your own reports'
-      });
-    }
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    // Build filter
+    const filter = {};
+    if (status) filter.status = status;
 
-    // Update report
-    const { data: updatedReport, error } = await supabaseAdmin
-      .from('reports')
-      .update({ 
-        description: description.trim(),
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', id)
-      .select(`
-        *,
-        users!reports_user_id_fkey (
-          id,
-          name,
-          email
-        )
-      `)
-      .single();
+    // Get total count
+    total = await Report.countDocuments(filter);
 
-    if (error) {
-      console.error('Edit report error:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to update report'
-      });
-    }
+    // Get reports with pagination
+    const sort = buildMongoSort(sortBy, sortOrder);
+    reports = await Report.find(filter)
+      .populate('author', 'username email')
+      .sort(sort)
+      .skip(skip)
+      .limit(limit);
+  } else {
+    // PostgreSQL
+    const where = {};
+    if (status) where.status = status;
 
-    res.json({
-      success: true,
-      message: 'Report updated successfully',
-      data: {
-        report: updatedReport
-      }
+    const order = buildSequelizeOrder(sortBy, sortOrder);
+
+    // Get reports with pagination
+    const result = await Report.findAndCountAll({
+      where,
+      include: [{
+        model: User,
+        as: 'author',
+        attributes: ['id', 'username', 'email']
+      }],
+      order,
+      limit,
+      offset: skip
     });
-  } catch (error) {
-    console.error('Edit report controller error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
+
+    reports = result.rows;
+    total = result.count;
+  }
+
+  // Format reports
+  const formattedReports = reports.map(formatReportResponse);
+  
+  // Build pagination metadata
+  const pagination = buildPaginationMeta(page, limit, total);
+
+  res.status(HTTP_STATUS.OK).json(
+    createApiResponse(
+      true, 
+      'Reports retrieved successfully', 
+      { reports: formattedReports },
+      { pagination }
+    )
+  );
+});
+
+/**
+ * Get a single report by ID
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const getReportById = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'Get Report by ID');
+  
+  const { id } = req.params;
+  const Report = getReportModel();
+  const User = getUserModel();
+
+  let report;
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    report = await Report.findById(id).populate('author', 'username email');
+  } else {
+    report = await Report.findByPk(id, {
+      include: [{
+        model: User,
+        as: 'author',
+        attributes: ['id', 'username', 'email']
+      }]
     });
   }
-};
 
-export const vouchReport = async (req, res) => {
-  try {
-    const { id } = req.params;
+  if (!report) {
+    throw new AppError(ERROR_MESSAGES.REPORT_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+  }
 
-    // Check if report exists
-    const { data: existingReport, error: fetchError } = await supabaseAdmin
-      .from('reports')
-      .select('*')
-      .eq('id', id)
-      .single();
+  const reportResponse = formatReportResponse(report);
+  
+  res.status(HTTP_STATUS.OK).json(
+    createApiResponse(true, 'Report retrieved successfully', { report: reportResponse })
+  );
+});
 
-    if (fetchError || !existingReport) {
-      return res.status(404).json({
-        success: false,
-        message: 'Report not found'
-      });
-    }
+/**
+ * Update a report (owner only)
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const updateReport = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'Update Report');
+  
+  const { title, description, status } = req.body;
+  const report = req.resource; // Set by requireOwnership middleware
+  const Report = getReportModel();
+  const User = getUserModel();
 
-    // Check if user already vouched for this report
-    const { data: existingVouch } = await supabaseAdmin
-      .from('report_vouches')
-      .select('id')
-      .eq('report_id', id)
-      .eq('user_id', req.user.id)
-      .single();
+  // Update fields
+  const updates = {};
+  if (title !== undefined) updates.title = title;
+  if (description !== undefined) updates.description = description;
+  if (status !== undefined) updates.status = status;
 
-    if (existingVouch) {
-      return res.status(400).json({
-        success: false,
-        message: 'You have already vouched for this report'
-      });
-    }
-
-    // Create vouch record
-    const { error: vouchError } = await supabaseAdmin
-      .from('report_vouches')
-      .insert([{
-        report_id: id,
-        user_id: req.user.id,
-        created_at: new Date().toISOString()
-      }]);
-
-    if (vouchError) {
-      console.error('Vouch creation error:', vouchError);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to vouch for report'
-      });
-    }
-
-    // Update vouch count
-    const { data: updatedReport, error: updateError } = await supabaseAdmin
-      .from('reports')
-      .update({ 
-        vouch_count: existingReport.vouch_count + 1 
-      })
-      .eq('id', id)
-      .select(`
-        *,
-        users!reports_user_id_fkey (
-          id,
-          name,
-          email
-        )
-      `)
-      .single();
-
-    if (updateError) {
-      console.error('Vouch count update error:', updateError);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to update vouch count'
-      });
-    }
-
-    res.json({
-      success: true,
-      message: 'Report vouched successfully',
-      data: {
-        report: updatedReport
-      }
-    });
-  } catch (error) {
-    console.error('Vouch report controller error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
+  let updatedReport;
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    Object.assign(report, updates);
+    updatedReport = await report.save();
+    await updatedReport.populate('author', 'username email');
+  } else {
+    await report.update(updates);
+    updatedReport = await Report.findByPk(report.id, {
+      include: [{
+        model: User,
+        as: 'author',
+        attributes: ['id', 'username', 'email']
+      }]
     });
   }
-};
 
-export const getReports = async (req, res) => {
-  try {
-    const { 
-      page = 1, 
-      limit = 20, 
-      category, 
-      status, 
-      priority,
-      user_id 
-    } = req.query;
+  const reportResponse = formatReportResponse(updatedReport);
+  
+  res.status(HTTP_STATUS.OK).json(
+    createApiResponse(true, SUCCESS_MESSAGES.REPORT_UPDATED, { report: reportResponse })
+  );
+});
 
-    const offset = (page - 1) * limit;
+/**
+ * Delete a report (owner only)
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const deleteReport = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'Delete Report');
+  
+  const report = req.resource; // Set by requireOwnership middleware
 
-    let query = supabaseAdmin
-      .from('reports')
-      .select(`
-        *,
-        users!reports_user_id_fkey (
-          id,
-          name,
-          email
-        )
-      `, { count: 'exact' })
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
-
-    // Apply filters
-    if (category) {
-      query = query.eq('category', category);
+  // Delete photo from S3 if exists
+  if (report.photoUrl) {
+    try {
+      await s3Service.deleteFile(report.photoUrl);
+    } catch (error) {
+      console.error('Failed to delete photo from S3:', error);
+      // Continue with report deletion even if S3 deletion fails
     }
-    if (status) {
-      query = query.eq('status', status);
-    }
-    if (priority) {
-      query = query.eq('priority', priority);
-    }
-    if (user_id) {
-      query = query.eq('user_id', user_id);
-    }
+  }
 
-    const { data: reports, error, count } = await query;
+  // Delete report
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    await report.deleteOne();
+  } else {
+    await report.destroy();
+  }
 
-    if (error) {
-      console.error('Get reports error:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch reports'
-      });
-    }
+  res.status(HTTP_STATUS.NO_CONTENT).json(
+    createApiResponse(true, SUCCESS_MESSAGES.REPORT_DELETED)
+  );
+});
 
-    res.json({
-      success: true,
-      data: {
-        reports,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total: count,
-          pages: Math.ceil(count / limit)
-        }
-      }
-    });
-  } catch (error) {
-    console.error('Get reports controller error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
+/**
+ * Toggle upvote on a report
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+export const toggleUpvote = asyncHandler(async (req, res) => {
+  logApiRequest(req, 'Toggle Upvote');
+  
+  const { id: reportId } = req.params;
+  const userId = req.user.id || req.user._id;
+  const Report = getReportModel();
+  const Upvote = getUpvoteModel();
+  const User = getUserModel();
+
+  // Check if report exists
+  let report;
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    report = await Report.findById(reportId);
+  } else {
+    report = await Report.findByPk(reportId);
+  }
+
+  if (!report) {
+    throw new AppError(ERROR_MESSAGES.REPORT_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+  }
+
+  // Check if user already upvoted
+  let existingUpvote;
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    existingUpvote = await Upvote.findOne({ user: userId, report: reportId });
+  } else {
+    existingUpvote = await Upvote.findOne({
+      where: { userId, reportId }
     });
   }
-};
 
-export const getReportById = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { data: report, error } = await supabaseAdmin
-      .from('reports')
-      .select(`
-        *,
-        users!reports_user_id_fkey (
-          id,
-          name,
-          email
-        )
-      `)
-      .eq('id', id)
-      .single();
-
-    if (error || !report) {
-      return res.status(404).json({
-        success: false,
-        message: 'Report not found'
-      });
+  let message;
+  if (existingUpvote) {
+    // Remove upvote
+    if (process.env.DATABASE_TYPE === 'mongodb') {
+      await existingUpvote.deleteOne();
+      await Report.findByIdAndUpdate(reportId, { $inc: { upvoteCount: -1 } });
+    } else {
+      await existingUpvote.destroy();
+      await report.decrement('upvoteCount');
     }
+    message = SUCCESS_MESSAGES.UPVOTE_REMOVED;
+  } else {
+    // Add upvote
+    if (process.env.DATABASE_TYPE === 'mongodb') {
+      await Upvote.create({ user: userId, report: reportId });
+      await Report.findByIdAndUpdate(reportId, { $inc: { upvoteCount: 1 } });
+    } else {
+      await Upvote.create({ userId, reportId });
+      await report.increment('upvoteCount');
+    }
+    message = SUCCESS_MESSAGES.UPVOTE_ADDED;
+  }
 
-    res.json({
-      success: true,
-      data: {
-        report
-      }
-    });
-  } catch (error) {
-    console.error('Get report by ID controller error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
+  // Get updated report
+  let updatedReport;
+  if (process.env.DATABASE_TYPE === 'mongodb') {
+    updatedReport = await Report.findById(reportId).populate('author', 'username email');
+  } else {
+    updatedReport = await Report.findByPk(reportId, {
+      include: [{
+        model: User,
+        as: 'author',
+        attributes: ['id', 'username', 'email']
+      }]
     });
   }
-};
+
+  const reportResponse = formatReportResponse(updatedReport);
+  
+  res.status(HTTP_STATUS.OK).json(
+    createApiResponse(true, message, { report: reportResponse })
+  );
+});
